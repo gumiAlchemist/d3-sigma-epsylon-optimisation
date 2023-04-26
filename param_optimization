@@ -1,0 +1,133 @@
+import pandas as pd
+import numpy as np
+from openmm.app import *
+from openmm import *
+from openmm.unit import *
+from sys import stdout
+from openmm import app
+from dftd3.interface import RationalDampingParam, DispersionModel
+import shutil
+import scipy
+import openmm
+elements = ['F', 'C', 'H', 'Cl', 'N', 'O', 'S', 'Br', 'I']
+nums = [2.9, 0.06, 3.55, 0.07, 2.46, 0.03, 3.4, 0.3, 3.25, 0.17, 3.0, 0.17, 3.6, 0.355, 3.47, 0.47, 3.55, 0.58, 1.0, 0.9171, 0.3385, 2.883]
+ns6, ns8, na1, na2 = nums[-4], nums[-3], nums[-2], nums[-1]
+sigma = {el: nums[2 * i]/10 for i, el in enumerate(elements)}
+epsilon = {el: nums[2 * i+1]*4.184 for i, el in enumerate(elements)}
+numatoms = {'F':9, 'C':6, 'H':1, 'Cl':17, 'N':7, 'O':8, 'S':16, 'Br':35, 'I':53}
+
+excel_data = pd.read_excel('/mnt/c/ПРоект/Edispandnamesx40x10(1).xlsx')
+data = pd.DataFrame(excel_data, columns=['имя без цифр', 'mol1', 'mol2', 'E dissotiation', 'Full file name'])
+
+names=[]
+for file in os.listdir('/mnt/c/ПРоект/файлы/ELF3_num/'):
+    names.append('/mnt/c/ПРоект/файлы/ELF3_num/'+file)
+forcefield = app.ForceField(*names)
+
+
+def OPLS_LJ(system, sigma, epsilon):
+    forces = {system.getForce(index).__class__.__name__: system.getForce(
+        index) for index in range(system.getNumForces())}
+    nonbonded_force = forces['NonbondedForce']
+    lorentz = CustomNonbondedForce(
+        '4*epsilon*((sigma/r)^12); sigma=(sigma1+sigma2)/2; epsilon=sqrt(epsilon1*epsilon2)')
+    lorentz.setNonbondedMethod(nonbonded_force.getNonbondedMethod())
+    lorentz.addPerParticleParameter('sigma')
+    lorentz.addPerParticleParameter('epsilon')
+    lorentz.setCutoffDistance(nonbonded_force.getCutoffDistance())
+    system.addForce(lorentz)
+    LJset = {}
+    for index in range(nonbonded_force.getNumParticles()):
+        charge, sigma, epsilon = nonbonded_force.getParticleParameters(index)
+        LJset[index] = (sigma, epsilon)
+        lorentz.addParticle([sigma, epsilon])
+        nonbonded_force.setParticleParameters(
+            index, charge, sigma, epsilon*0)
+    for i in range(nonbonded_force.getNumExceptions()):
+        (p1, p2, q, sig, eps) = nonbonded_force.getExceptionParameters(i)
+        # ALL THE 12,13 and 14 interactions are EXCLUDED FROM CUSTOM NONBONDED
+        # FORCE
+        lorentz.addExclusion(p1, p2)
+        if eps._value != 0.0:
+            #print p1,p2,sig,eps
+            sig14 = (LJset[p1][0] + LJset[p2][0])/2
+            eps14 = sqrt(abs(LJset[p1][1] * LJset[p2][1]))
+            nonbonded_force.setExceptionParameters(i, p1, p2, q, sig14, eps)
+    return system
+
+def getting_openmm_Energy(file, sigma, epsilon, forcefield):
+    mol = PDBFile('/mnt/c/ПРоект/файлы/all_pdb/'+file)
+    model = Modeller(mol.topology, mol.getPositions())
+    model.addExtraParticles(forcefield)
+    system = forcefield.createSystem(model.topology)
+    positions = model.positions
+    system = OPLS_LJ(system, sigma, epsilon)
+    integrator = LangevinMiddleIntegrator(300*kelvin, 1/picosecond, 0.004*picoseconds)
+    simulation = Simulation(model.topology, system, integrator)
+    simulation.context.setPositions(model.positions)
+    E = simulation.context.getState(getEnergy=True)
+    OpenmmEnergy =E.getPotentialEnergy() / openmm.unit.kilocalorie_per_mole
+    return OpenmmEnergy 
+
+def pyD3Energy(filexyz, ns6, ns8, na1, na2):
+    with open('/mnt/c/ПРоект/файлы/all_structures/'+filexyz, 'r') as f:
+        lines = f.readlines()
+    atoms = lines[2:]
+    coords = []
+    elements = []
+    for atom in atoms:
+        data = atom.split()
+        elements.append (numatoms[data[0]])
+        coords.append ([float(float(d)/0.52917721090380) for d in data[1:]]) #in Bohr
+    numbers =np.array(elements)
+    positions = np.array(coords)
+    model = DispersionModel (numbers, positions)
+    res = model.get_dispersion(RationalDampingParam(s6=ns6, s8=ns8, a1=na1, a2=na2), grad=False)
+    EpyD3=(res.get("energy"))*((4.359744722207185e-18)*6.02e23*(1e-3)/4.198) # ккал/моль  #энергия хартри(википедия)
+    return EpyD3
+
+def Eopenmm_plus_ED3(file, sigma, epsilon, ns6, ns8, na1, na2, forcefield):
+    line = data[data['имя без цифр'] == file[:-4]]
+    filexyz=str(line['Full file name'].loc[line.index[0]])
+    return getting_openmm_Energy(file, sigma, epsilon, forcefield)+pyD3Energy(filexyz, ns6, ns8, na1, na2)
+
+def Edissotiation(filename, sigma, epsilon, ns6, ns8, na1, na2, forcefield):
+    line = data[data['имя без цифр'] == filename[:-4]]
+    mol1 = str(line['mol1'].loc[line.index[0]] + '.pdb')
+    mol2 = str(line['mol2'].loc[line.index[0]] + '.pdb')
+    Ed=Eopenmm_plus_ED3(filename, sigma, epsilon, ns6, ns8, na1, na2, forcefield)
+    for monfile in [mol1, mol2]:
+        Em=Eopenmm_plus_ED3(monfile, sigma, epsilon, ns6, ns8, na1, na2, forcefield)
+        Ed-=Em
+    return Ed
+
+def change_sigma_n_epsilon(file, sigma, epsilon, ns6, ns8, na1, na2):
+    filename = '/mnt/c/ПРоект/файлы/qube_LOL3_нужныесиловыеполя/' + file
+    shutil.copyfile(filename, "/mnt/c/ПРоект/файлы/ELF3_num/"+file)
+    with open("/mnt/c/ПРоект/файлы/ELF3_num/"+file, 'r') as f:
+        t = f.read()
+    for e in elements:
+        t = t.replace('{{%s_sigma}}'%e, '%f'%sigma.get(e))
+        t = t.replace('{{%s_epsilon}}'%e, '%f'%epsilon.get(e))
+    with open("/mnt/c/ПРоект/файлы/ELF3_num/"+file, 'w+') as c:
+        c.write(t)
+
+def Esum_allfiles(nums):
+    elements = ['F', 'C', 'H', 'Cl', 'N', 'O', 'S', 'Br', 'I']
+    ns6, ns8, na1, na2 = nums[-4], nums[-3], nums[-2], nums[-1]
+    sigma = {el: abs(nums[2 * i])/10 for i, el in enumerate(elements)}
+    epsilon = {el: abs(nums[2 * i+1])*4.184 for i, el in enumerate(elements)}
+    for file in os.listdir('/mnt/c/ПРоект/файлы/qube_LOL3_нужныесиловыеполя'):
+        change_sigma_n_epsilon(file, sigma, epsilon, ns6, ns8, na1, na2)
+    forcefield = app.ForceField(*names)
+    Error=0
+    for filename in os.listdir('/mnt/c/ПРоект/файлы/pdb димеров'):
+        E_calc = Edissotiation(filename, sigma, epsilon, ns6, ns8, na1, na2, forcefield)
+        line = data[data['имя без цифр'] == filename[:-4]]
+        Etable=float(line['E dissotiation'].loc[line.index[0]])
+        Error += abs(E_calc - Etable)
+    print(Error, sigma, epsilon, ns6, ns8, na1, na2)
+    return Error
+
+result = scipy.optimize.minimize(Esum_allfiles, nums, method = 'Nelder-Mead', options={'disp': True})
+print(result.x)
